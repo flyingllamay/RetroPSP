@@ -1,0 +1,2437 @@
+========================================================================
+                        RETRO PSP EMULATOR CODE                         
+========================================================================
+
+NOTE ON NATIVE ENGINE:
+This application relies on the PPSSPP core engine for emulation.
+The C++ core files (org.ppsspp.ppsspp package and native libraries)
+are omitted from this document as they are part of the original PPSSPP
+open-source project. Please refer to https://github.com/hrydgard/ppsspp 
+for the original emulation core source code.
+
+AdMob Ad Unit IDs and App IDs have been masked with asterisks.
+
+========================================================================
+
+
+
+--- FILE: app/src/main/java/com/retropsp/app/RetroPspApplication.kt ---
+
+package com.retropsp.app
+
+import android.app.Application
+import com.retropsp.app.data.db.GameDatabase
+
+class RetroPspApplication : Application() {
+    val database by lazy { GameDatabase.getDatabase(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Load the PPSSPP native JNI library so NativeApp.* calls work
+        System.loadLibrary("ppsspp_jni")
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/RetroPspNavigation.kt ---
+
+package com.retropsp.app
+
+import android.app.Activity
+import android.net.Uri
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.platform.LocalContext
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.retropsp.app.monetization.AdMobHelper
+import com.retropsp.app.ui.home.HomeScreen
+import com.retropsp.app.ui.ingame.InGameScreen
+import com.retropsp.app.ui.onboarding.OnboardingScreen
+import com.retropsp.app.ui.settings.SettingsScreen
+
+@Composable
+fun RetroPspNavigation(
+    hasSafPermission: Boolean,
+    adMobHelper: AdMobHelper,
+    onFolderSelected: (Uri) -> Unit,
+    onRescanClick: () -> Unit
+) {
+    val navController = rememberNavController()
+    val startDest = if (hasSafPermission) "home" else "onboarding"
+    val activity = LocalContext.current as Activity
+
+    NavHost(navController = navController, startDestination = startDest) {
+
+        composable("onboarding") {
+            OnboardingScreen { uri ->
+                onFolderSelected(uri)
+                navController.navigate("home") {
+                    popUpTo("onboarding") { inclusive = true }
+                }
+            }
+        }
+
+        composable("home") {
+            HomeScreen(
+                onGameClick = { game ->
+                    adMobHelper.forceShowInterstitial(activity) {
+                        navController.navigate("ingame/${Uri.encode(game.uriString)}")
+                    }
+                },
+                onSettingsClick = { navController.navigate("settings") },
+                onRescanClick = {
+                    adMobHelper.forceShowInterstitial(activity) {
+                        onRescanClick()
+                    }
+                },
+                onFolderSelected = onFolderSelected
+            )
+        }
+
+        composable(
+            route = "ingame/{uri}",
+            arguments = listOf(navArgument("uri") { type = NavType.StringType })
+        ) { backStack ->
+            val encoded = backStack.arguments?.getString("uri") ?: ""
+            InGameScreen(
+                gameUriString = Uri.decode(encoded),
+                adMobHelper = adMobHelper,
+                onBack = {
+                    adMobHelper.forceShowInterstitial(activity) {
+                        navController.popBackStack()
+                    }
+                }
+            )
+        }
+
+        composable("settings") {
+            SettingsScreen(
+                onBack = { navController.popBackStack() },
+                onFolderSelected = { uri ->
+                    onFolderSelected(uri)
+                    navController.popBackStack()
+                }
+            )
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/MainActivity.kt ---
+
+package com.retropsp.app
+
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.util.DisplayMetrics
+import android.view.WindowManager
+import java.io.File
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.ui.Modifier
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
+import com.retropsp.app.data.saf.RomScanWorker
+import com.retropsp.app.data.saf.SafPermissionManager
+import com.retropsp.app.monetization.AdMobHelper
+import com.retropsp.app.ui.theme.RetroPSPTheme
+import org.ppsspp.ppsspp.NativeApp
+import org.ppsspp.ppsspp.TextRenderer
+
+class MainActivity : org.ppsspp.ppsspp.PpssppActivity() {
+
+    private lateinit var safManager: SafPermissionManager
+    private lateinit var adMobHelper: AdMobHelper
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        registerCallbacks()
+
+        safManager = SafPermissionManager(this)
+        adMobHelper = AdMobHelper(this)
+        val persistedUri = safManager.getPersistedUri()
+        val hasPermission = persistedUri != null && safManager.isPermissionValid(persistedUri)
+
+        setContent {
+            RetroPSPTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    RetroPspNavigation(
+                        hasSafPermission = hasPermission,
+                        adMobHelper = adMobHelper,
+                        onFolderSelected = { uri -> persistAndScan(uri) },
+                        onRescanClick = {
+                            val uri = safManager.getPersistedUri()
+                            if (uri != null) triggerScan(uri)
+                        }
+                    )
+                }
+            }
+        }
+
+        try {
+            TextRenderer.init(this)
+            initializeNativeApp()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to initialize PPSSPP", e)
+        }
+    }
+
+    override fun onDestroy() {
+        unregisterCallbacks()
+        super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        NativeApp.resume()
+        updateDisplayParameters()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        NativeApp.pause()
+    }
+
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        // Forward physical button presses (Gamepad, etc.) to the Native core
+        val isDown = event.action == android.view.KeyEvent.ACTION_DOWN
+        val isHandled = if (isDown) {
+            NativeApp.keyDown(event.deviceId, event.keyCode, event.repeatCount > 0)
+        } else if (event.action == android.view.KeyEvent.ACTION_UP) {
+            NativeApp.keyUp(event.deviceId, event.keyCode)
+        } else {
+            false
+        }
+
+        // If PPSSPP handled the key (like X or Start), stop it from bubbling up to Jetpack Compose!
+        if (isHandled) return true
+
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        // Forward analog stick and trigger movements to the Native core
+        if ((event.source and android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK) {
+            val axes = intArrayOf(
+                android.view.MotionEvent.AXIS_X, android.view.MotionEvent.AXIS_Y,
+                android.view.MotionEvent.AXIS_Z, android.view.MotionEvent.AXIS_RZ,
+                android.view.MotionEvent.AXIS_HAT_X, android.view.MotionEvent.AXIS_HAT_Y,
+                android.view.MotionEvent.AXIS_LTRIGGER, android.view.MotionEvent.AXIS_RTRIGGER
+            )
+            val values = FloatArray(axes.size)
+            for (i in axes.indices) {
+                values[i] = event.getAxisValue(axes[i])
+            }
+            NativeApp.joystickAxis(event.deviceId, axes, values, axes.size)
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun initializeNativeApp() {
+        val languageRegion = java.util.Locale.getDefault().let { "${it.language}_${it.country}" }
+        val apkPath = applicationInfo.sourceDir
+        val dataDir = filesDir.absolutePath
+        val externalStorageDir = getExternalFilesDir(null)?.absolutePath ?: dataDir
+
+        try {
+            val iniDir = File(externalStorageDir, "PSP/SYSTEM")
+            iniDir.mkdirs()
+            val iniFile = File(iniDir, "ppsspp.ini")
+            
+            iniFile.writeText(buildString {
+                // ── Graphics ─────────────────────────────────────────────
+                appendLine("[Graphics]")
+                appendLine("iGPUBackend = 0")
+                appendLine("useCPUThread = True")
+                appendLine()
+
+                // ── Theme ─────────────────────────────────────────────────
+                appendLine("[Theme]")
+                appendLine("ThemeName = NeonDark")
+                appendLine()
+
+                // ── Touch control layout (verified key names from Config.cpp) ──
+                // Positions are 0.0–1.0 relative to the screen (landscape mode).
+                // Written on every launch so buttons never drift from these spots.
+                appendLine("[Control]")
+                appendLine("ShowTouchControls = True")  // Usiamo quelli base dell'emulatore nativi
+                appendLine("TouchButtonOpacity = 65")
+                appendLine("TouchButtonScale = 1.15")
+                appendLine()
+
+                // ── Touch layout: PPSSPP reads AND writes this section ────────
+                // [TouchControls.Landscape] is the canonical section for layout.
+                // [Control] is only kept for legacy compatibility reads.
+                appendLine("[TouchControls.Landscape]")
+                appendLine()
+                // D-Pad — brought slightly closer to the center, lowered a bit
+                appendLine("DPadX = 0.14")
+                appendLine("DPadY = 0.54")
+                appendLine("DPadScale = 1.21")
+                appendLine("DPadSpacing = 1.35")
+                appendLine("ShowTouchDpad = True")
+                appendLine()
+                // Face buttons (Cross/Circle/Square/Triangle) — aligned horizontally, brought closer, lowered a bit
+                appendLine("ActionButtonCenterX = 0.86")
+                appendLine("ActionButtonCenterY = 0.54")
+                appendLine("ActionButtonScale = 1.21")
+                appendLine("ActionButtonSpacing2 = 1.35")
+                appendLine()
+                // Analog stick — placed EXACTLY below the D-Pad, lowered slightly to match D-Pad shift
+                appendLine("AnalogStickX = 0.14")
+                appendLine("AnalogStickY = 0.88")
+                appendLine("AnalogStickScale = 1.15")
+                appendLine("ShowAnalogStick = True")
+                appendLine()
+                // L trigger — lowered to Y = 0.26
+                appendLine("LKeyX = 0.08")
+                appendLine("LKeyY = 0.26")
+                appendLine("LKeyScale = 1.15")
+                appendLine("ShowTouchLTrigger = True")
+                appendLine()
+                // R trigger — lowered to Y = 0.26
+                appendLine("RKeyX = 0.92")
+                appendLine("RKeyY = 0.26")
+                appendLine("RKeyScale = 1.15")
+                appendLine("ShowTouchRTrigger = True")
+                appendLine()
+                // Centered Bottom Controls: Select (0.38), Turbo (0.50), Start (0.62)
+                appendLine("SelectKeyX = 0.38")
+                appendLine("SelectKeyY = 0.90")
+                appendLine("SelectKeyScale = 1.1")
+                appendLine("ShowTouchSelect = True")
+                appendLine()
+                appendLine("UnthrottleKeyX = 0.50")
+                appendLine("UnthrottleKeyY = 0.90")
+                appendLine("UnthrottleKeyScale = 1.1")
+                appendLine("ShowTouchUnthrottle = True")
+                appendLine()
+                appendLine("StartKeyX = 0.62")
+                appendLine("StartKeyY = 0.90")
+                appendLine("StartKeyScale = 1.1")
+                appendLine("ShowTouchStart = True")
+                appendLine()
+                // Pause — top center
+                appendLine("PauseKeyX = 0.50")
+                appendLine("PauseKeyY = 0.08")
+                appendLine("PauseKeyScale = 1.1")
+                appendLine("ShowTouchPause = True")
+            })
+            
+            // Install custom background for the native PPSSPP menu
+            val bgFile = File(iniDir, "background.png")
+            if (!bgFile.exists()) {
+                assets.open("background.png").use { input ->
+                    bgFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+            
+            // Install custom theme colors
+            val themesDir = File(externalStorageDir, "PSP/themes")
+            themesDir.mkdirs()
+            val themeFile = File(themesDir, "theme.ini")
+            if (!themeFile.exists()) {
+                assets.open("theme.ini").use { input ->
+                    themeFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+            
+            // Force PPSSPP to use this external storage directory as memstick root
+            // This is necessary for Android 11+ where PPSSPP leaves memStickDirectory empty by default
+            val memstickTxt = File(dataDir, "memstick_dir.txt")
+            memstickTxt.writeText(externalStorageDir)
+            
+        } catch (e: Exception) {
+            Log.e("MainActivity", "INI error", e)
+        }
+        
+        val nativeLibDir = applicationInfo.nativeLibraryDir
+        val cacheDir = cacheDir.absolutePath
+        val board = android.os.Build.BOARD
+        val model = android.os.Build.MODEL
+        val androidVersion = android.os.Build.VERSION.SDK_INT
+
+        NativeApp.init(
+            model, 0, languageRegion, apkPath, dataDir, 
+            externalStorageDir, externalStorageDir, nativeLibDir,
+            "", cacheDir, "", "", androidVersion, board
+        )
+        NativeApp.audioInit()
+        updateDisplayParameters()
+    }
+
+    private fun updateDisplayParameters() {
+        try {
+            val metrics = DisplayMetrics()
+            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            val refreshRate = windowManager.defaultDisplay.refreshRate
+            NativeApp.setDisplayParameters(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi, refreshRate)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to update display parameters", e)
+        }
+    }
+
+    private fun persistAndScan(uri: Uri) {
+        safManager.persistPermission(uri)
+        triggerScan(uri)
+    }
+
+    private fun triggerScan(uri: Uri) {
+        val request = OneTimeWorkRequestBuilder<RomScanWorker>()
+            .setInputData(workDataOf("folder_uri" to uri.toString()))
+            .build()
+        WorkManager.getInstance(this).enqueue(request)
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/saf/RomScanWorker.kt ---
+
+package com.retropsp.app.data.saf
+
+import android.content.Context
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.util.Log
+import androidx.documentfile.provider.DocumentFile
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.retropsp.app.data.db.GameDatabase
+import com.retropsp.app.data.db.GameEntity
+import java.io.File
+
+class RomScanWorker(
+    appContext: Context,
+    workerParams: WorkerParameters
+) : CoroutineWorker(appContext, workerParams) {
+
+    private val validExtensions = setOf("iso", "cso", "pbp", "zip")
+
+    override suspend fun doWork(): Result {
+        val folderUriString = inputData.getString("folder_uri") ?: return Result.failure()
+        val folderUri = Uri.parse(folderUriString)
+
+        val db = GameDatabase.getDatabase(applicationContext)
+        val gameDao = db.gameDao()
+
+        val games = mutableListOf<GameEntity>()
+        Log.d("RomScanWorker", "Starting scan for URI: $folderUri")
+
+        if (folderUri.scheme == "content") {
+            val folder = DocumentFile.fromTreeUri(applicationContext, folderUri)
+                ?: return Result.failure()
+            scanContentDirectory(folder, games)
+        } else {
+            val path = folderUri.path ?: return Result.failure()
+            val folder = File(path)
+            if (!folder.exists() || !folder.isDirectory) {
+                // Try fallback for content style paths if they get passed here
+                return Result.failure()
+            }
+            scanFileDirectory(folder, games)
+        }
+
+        Log.d("RomScanWorker", "Scan complete. Found ${games.size} games.")
+
+        gameDao.clearAll()
+        gameDao.insertAll(games)
+
+        return Result.success()
+    }
+
+    private fun scanContentDirectory(dir: DocumentFile, games: MutableList<GameEntity>) {
+        dir.listFiles().forEach { file ->
+            if (file.isDirectory) {
+                scanContentDirectory(file, games)
+            } else {
+                val name = file.name ?: return@forEach
+                val ext = name.substringAfterLast('.').lowercase()
+                if (ext in validExtensions) {
+                    val docId = DocumentsContract.getDocumentId(file.uri)
+                    games.add(
+                        GameEntity(
+                            title = name.substringBeforeLast('.'),
+                            uriString = docId
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun scanFileDirectory(dir: File, games: MutableList<GameEntity>) {
+        dir.listFiles()?.forEach { file ->
+            if (file.isDirectory) {
+                scanFileDirectory(file, games)
+            } else {
+                val name = file.name
+                val ext = name.substringAfterLast('.').lowercase()
+                if (ext in validExtensions) {
+                    games.add(
+                        GameEntity(
+                            title = name.substringBeforeLast('.'),
+                            uriString = file.absolutePath
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/saf/SafPermissionManager.kt ---
+
+package com.retropsp.app.data.saf
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+
+class SafPermissionManager(private val context: Context) {
+
+    fun persistPermission(uri: Uri) {
+        if (uri.scheme == "content") {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        }
+        val prefs = context.getSharedPreferences("saf_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putString("rom_folder_uri", uri.toString()).apply()
+    }
+
+    fun getPersistedUri(): Uri? {
+        val prefs = context.getSharedPreferences("saf_prefs", Context.MODE_PRIVATE)
+        val uriString = prefs.getString("rom_folder_uri", null) ?: return null
+        return Uri.parse(uriString)
+    }
+
+    fun isPermissionValid(uri: Uri): Boolean {
+        if (uri.scheme != "content") return true
+        return context.contentResolver.persistedUriPermissions
+            .any { it.uri == uri && it.isReadPermission }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/db/GameDao.kt ---
+
+package com.retropsp.app.data.db
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface GameDao {
+
+    @Query("SELECT * FROM games ORDER BY title ASC")
+    fun getAllGames(): Flow<List<GameEntity>>
+
+    @Query("SELECT * FROM games WHERE lastPlayed > 0 ORDER BY lastPlayed DESC LIMIT 10")
+    fun getRecentGames(): Flow<List<GameEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(games: List<GameEntity>)
+
+    @Query("UPDATE games SET lastPlayed = :ts WHERE id = :id")
+    suspend fun updateLastPlayed(id: Long, ts: Long)
+
+    @Query("DELETE FROM games")
+    suspend fun clearAll()
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/db/GameEntity.kt ---
+
+package com.retropsp.app.data.db
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "games")
+data class GameEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,
+    val uriString: String,
+    val coverArtPath: String? = null,
+    val lastPlayed: Long = 0L   // epoch ms — used for "Recently played" row
+)
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/db/GameDatabase.kt ---
+
+package com.retropsp.app.data.db
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+@Database(entities = [GameEntity::class], version = 1, exportSchema = false)
+abstract class GameDatabase : RoomDatabase() {
+    abstract fun gameDao(): GameDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: GameDatabase? = null
+
+        fun getDatabase(context: Context): GameDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    GameDatabase::class.java,
+                    "retropsp_database"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/data/scraper/ScreenScraperRepository.kt ---
+
+package com.retropsp.app.data.scraper
+
+import kotlinx.coroutines.delay
+import java.util.concurrent.atomic.AtomicLong
+
+class ScreenScraperRepository {
+    // Rate limit: max 1 request/second for anonymous users
+    private val lastRequestTime = AtomicLong(0)
+
+    /**
+     * Returns a cover art URL for the given game filename, or null if not found.
+     * Replace YOUR_DEV_ID and YOUR_DEV_PASS with real ScreenScraper credentials.
+     */
+    suspend fun getCoverArtUrl(filename: String): String? {
+        enforceRateLimit()
+        // Real call would use Retrofit/Ktor:
+        // GET https://screenscraper.fr/api2/jeuRecherche.php?
+        //   devid=YOUR_DEV_ID&devpassword=YOUR_DEV_PASS&softname=RetroPSP&
+        //   output=json&romnom=<filename>&systemeid=13
+        return null // Placeholder — wire up Retrofit when dev credentials are available
+    }
+
+    private suspend fun enforceRateLimit() {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastRequestTime.get()
+        if (elapsed < 1000) delay(1000 - elapsed)
+        lastRequestTime.set(System.currentTimeMillis())
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/ingame/InGameScreen.kt ---
+
+package com.retropsp.app.ui.ingame
+
+import android.net.Uri
+import android.util.Log
+import android.provider.DocumentsContract
+import android.view.SurfaceHolder
+import org.ppsspp.ppsspp.NativeGLSurfaceView
+import org.ppsspp.ppsspp.NativeRenderer
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.activity.compose.BackHandler
+import org.ppsspp.ppsspp.NativeApp
+
+import android.app.Activity
+import com.retropsp.app.monetization.AdMobHelper
+import com.retropsp.app.monetization.SaveStateObserver
+import java.io.File
+
+@Composable
+fun InGameScreen(
+    gameUriString: String,
+    adMobHelper: AdMobHelper,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val activity = context as Activity
+    var isReadyToBoot by remember { mutableStateOf(false) }
+    var bootTriggered  by remember { mutableStateOf(false) }
+    var showExitDialog by remember { mutableStateOf(false) }
+
+    val basePspDir = remember {
+        File(context.getExternalFilesDir(null) ?: context.filesDir, "PSP")
+    }
+
+    val saveObserver = remember {
+        SaveStateObserver(activity, adMobHelper, basePspDir)
+    }
+
+    // Intercetta il back fisico → mostra il pop-up di conferma esegui-salvataggio
+    BackHandler {
+        showExitDialog = true
+    }
+
+    // ── Boot Game ─────────────────────────────────────────────────────────────
+    LaunchedEffect(isReadyToBoot) {
+        if (!isReadyToBoot || bootTriggered) return@LaunchedEffect
+        bootTriggered = true
+
+        try {
+            val treeUri = com.retropsp.app.data.saf.SafPermissionManager(context).getPersistedUri()
+            if (treeUri == null) return@LaunchedEffect
+
+            val bootPath = if (treeUri.scheme == "content") {
+                val documentId = if (gameUriString.startsWith("content://")) {
+                    if (gameUriString.contains("/document/")) gameUriString.substringAfter("/document/")
+                    else DocumentsContract.getDocumentId(Uri.parse(gameUriString))
+                } else gameUriString
+                DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+            } else {
+                // local file path
+                gameUriString
+            }
+
+            Log.d("InGameScreen", "Booting game: $bootPath")
+            NativeApp.sendMessageFromJava("shortcutParam", bootPath)
+            NativeApp.sendMessageFromJava("boot", "")
+            NativeApp.resume()
+        } catch (e: Exception) {
+            Log.e("InGameScreen", "Boot Error: ${e.message}")
+        }
+    }
+
+    DisposableEffect(Unit) {
+        saveObserver.start()
+        onDispose { 
+            saveObserver.stop()
+            NativeApp.sendMessageFromJava("finish", "") 
+        }
+    }
+
+    // ── Dialog di conferma uscita ──────────────────────────────────────────────
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+            title = {
+                Text(
+                    text = "Exit Game?",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                Text(
+                    text = "Are you sure you want to return to the menu? Unsaved progress will be lost. Make sure to save your game progress inside the game before exiting!",
+                    color = Color(0xFFCCCCCC),
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showExitDialog = false
+                        onBack()
+                    }
+                ) {
+                    Text("Yes, Exit", color = Color(0xFFE53935), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showExitDialog = false }
+                ) {
+                    Text("Cancel", color = Color(0xFF888888), fontWeight = FontWeight.Medium)
+                }
+            },
+            containerColor = Color(0xFF151515)
+        )
+    }
+
+    // ── Layout ───────────────────────────────────────────────────────────────
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        // Superficie PPSSPP con controlli nativi
+        AndroidView(
+            factory = { ctx ->
+                NativeGLSurfaceView(ctx).apply {
+                    setEGLContextClientVersion(2)
+                    setRenderer(NativeRenderer())
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) {
+                            Log.d("InGameScreen", "Surface Ready")
+                            NativeApp.backbufferResize(width, height, 0)
+                            // Abilita i controlli touch nativi di PPSSPP
+                            NativeApp.sendMessageFromJava("set_config", "iConfShowTouchControls:1")
+                            NativeApp.resume()
+                            isReadyToBoot = true
+                        }
+                        override fun surfaceChanged(holder: SurfaceHolder, f: Int, w: Int, h: Int) {
+                            NativeApp.backbufferResize(w, h, 0)
+                        }
+                        override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            NativeApp.pause()
+                        }
+                    })
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Premium Floating Exit Button (top-left corner)
+        Row(
+            modifier = Modifier
+                .padding(12.dp)
+                .align(Alignment.TopStart)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color(0xCC111111))
+                .border(BorderStroke(1.dp, Color(0xFF333333)), RoundedCornerShape(8.dp))
+                .clickable { showExitDialog = true }
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                contentDescription = "Back",
+                tint = Color.White,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "Back to Menu",
+                color = Color.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp
+            )
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/ingame/InGameMenuOverlay.kt ---
+
+package com.retropsp.app.ui.ingame
+
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ExitToApp
+import androidx.compose.material.icons.rounded.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import org.ppsspp.ppsspp.NativeApp
+
+// ── Palette ──────────────────────────────────────────────────────────────────
+
+private val NeonCyan   = Color(0xFF00E5FF)
+private val NeonPurple = Color(0xFF9C27B0)
+private val NeonRed    = Color(0xFFFF1744)
+private val GlassWhite = Color(0x22FFFFFF)
+private val GlassBorder= Color(0x44FFFFFF)
+private val DarkBg     = Color(0xCC0A0A14)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Floating HOME button (sempre visibile durante il gioco)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun FloatingMenuButton(
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.88f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "home_btn_scale"
+    )
+
+    // Pulsante sempre visibile in basso al centro
+    Box(
+        modifier = modifier
+            .padding(bottom = 24.dp)
+            .scale(scale)
+            .size(52.dp)
+            .clip(CircleShape)
+            .background(
+                Brush.radialGradient(listOf(NeonCyan.copy(alpha = 0.30f), Color(0xFF0A0A14)))
+            )
+            .border(1.5.dp, Brush.linearGradient(listOf(NeonCyan, NeonPurple)), CircleShape)
+            .clickable(interactionSource = interactionSource, indication = null) { onOpen() },
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Menu,
+            contentDescription = "Apri menù",
+            tint = NeonCyan,
+            modifier = Modifier.size(24.dp)
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overlay completo (scrim + bottom-sheet)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun InGameMenuOverlay(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    onExit: () -> Unit
+) {
+    // Stato per i sotto-pannelli
+    var showSaveSlots by remember { mutableStateOf(false) }
+    var showLoadSlots by remember { mutableStateOf(false) }
+    var isTurbo       by remember { mutableStateOf(false) }
+
+    // Reset pannelli alla chiusura del menù
+    LaunchedEffect(visible) {
+        if (!visible) {
+            showSaveSlots = false
+            showLoadSlots = false
+        }
+    }
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(200)),
+        exit  = fadeOut(tween(200))
+    ) {
+        // Scrim scuro semitrasparente: click fuori chiude
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0x88000000))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { onDismiss() },
+            contentAlignment = Alignment.BottomCenter
+        ) {
+            AnimatedVisibility(
+                visible = visible,
+                enter = slideInVertically(tween(300, easing = FastOutSlowInEasing)) { it } + fadeIn(),
+                exit  = slideOutVertically(tween(250)) { it } + fadeOut()
+            ) {
+                // Blocca i click dal propagare al scrim
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { /* intercept */ }
+                ) {
+                    MenuSheet(
+                        isTurbo      = isTurbo,
+                        showSaveSlots = showSaveSlots,
+                        showLoadSlots = showLoadSlots,
+                        onResume = onDismiss,
+                        onSaveClick = {
+                            showLoadSlots = false
+                            showSaveSlots = !showSaveSlots
+                        },
+                        onLoadClick = {
+                            showSaveSlots = false
+                            showLoadSlots = !showLoadSlots
+                        },
+                        onSaveSlot = { slot ->
+                            saveState(slot)
+                            showSaveSlots = false
+                            onDismiss()
+                        },
+                        onLoadSlot = { slot ->
+                            loadState(slot)
+                            showLoadSlots = false
+                            onDismiss()
+                        },
+                        onScreenshot = {
+                            NativeApp.sendMessageFromJava("screenshot", "")
+                            onDismiss()
+                        },
+                        onTurbo = {
+                            isTurbo = !isTurbo
+                            val speed = if (isTurbo) "2.0" else "1.0"
+                            NativeApp.sendMessageFromJava("set_config", "fGameSpeed:$speed")
+                        },
+                        onExit = onExit
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sheet principale
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun MenuSheet(
+    isTurbo: Boolean,
+    showSaveSlots: Boolean,
+    showLoadSlots: Boolean,
+    onResume: () -> Unit,
+    onSaveClick: () -> Unit,
+    onLoadClick: () -> Unit,
+    onSaveSlot: (Int) -> Unit,
+    onLoadSlot: (Int) -> Unit,
+    onScreenshot: () -> Unit,
+    onTurbo: () -> Unit,
+    onExit: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
+            .background(DarkBg)
+            .border(
+                width = 1.dp,
+                brush = Brush.linearGradient(listOf(NeonCyan.copy(0.5f), NeonPurple.copy(0.5f))),
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+            )
+            .padding(bottom = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Handle bar
+        Box(
+            modifier = Modifier
+                .padding(top = 14.dp, bottom = 18.dp)
+                .size(width = 40.dp, height = 4.dp)
+                .clip(CircleShape)
+                .background(GlassBorder)
+        )
+
+        // Titolo "PAUSA"
+        Text(
+            text = "PAUSA",
+            color = NeonCyan,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 4.sp,
+            modifier = Modifier.padding(bottom = 20.dp)
+        )
+
+        // ── Riga voci principali ─────────────────────────────────────────────
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            MenuIconButton(icon = Icons.Rounded.PlayArrow, label = "Riprendi",
+                color = NeonCyan, onClick = onResume)
+
+            MenuIconButton(icon = Icons.Rounded.SaveAlt, label = "Salva",
+                color = Color(0xFF69FF47),
+                isActive = showSaveSlots,
+                onClick = onSaveClick)
+
+            MenuIconButton(icon = Icons.Rounded.FolderOpen, label = "Carica",
+                color = Color(0xFFFFCA28),
+                isActive = showLoadSlots,
+                onClick = onLoadClick)
+
+            MenuIconButton(
+                icon = if (isTurbo) Icons.Rounded.FlashOn else Icons.Rounded.FlashOff,
+                label = "Turbo",
+                color = if (isTurbo) Color(0xFFFF6D00) else GlassBorder.copy(alpha = 0.8f),
+                isActive = isTurbo,
+                onClick = onTurbo
+            )
+
+            MenuIconButton(icon = Icons.Rounded.CameraAlt, label = "Screen",
+                color = NeonPurple, onClick = onScreenshot)
+        }
+
+        // ── Selettore slot SALVA ─────────────────────────────────────────────
+        AnimatedVisibility(
+            visible = showSaveSlots,
+            enter = expandVertically(tween(220)) + fadeIn(),
+            exit  = shrinkVertically(tween(180)) + fadeOut()
+        ) {
+            SlotSelector(
+                label = "Salva su slot",
+                accentColor = Color(0xFF69FF47),
+                onSlotSelected = onSaveSlot
+            )
+        }
+
+        // ── Selettore slot CARICA ────────────────────────────────────────────
+        AnimatedVisibility(
+            visible = showLoadSlots,
+            enter = expandVertically(tween(220)) + fadeIn(),
+            exit  = shrinkVertically(tween(180)) + fadeOut()
+        ) {
+            SlotSelector(
+                label = "Carica da slot",
+                accentColor = Color(0xFFFFCA28),
+                onSlotSelected = onLoadSlot
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+
+        // ── Pulsante Esci ────────────────────────────────────────────────────
+        Box(
+            modifier = Modifier
+                .padding(horizontal = 32.dp)
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(NeonRed.copy(alpha = 0.12f))
+                .border(1.dp, NeonRed.copy(alpha = 0.40f), RoundedCornerShape(14.dp))
+                .clickable { onExit() }
+                .padding(vertical = 14.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Icon(Icons.AutoMirrored.Rounded.ExitToApp, contentDescription = null,
+                    tint = NeonRed, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Esci alla Libreria", color = NeonRed,
+                    fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Componente: icona-pulsante verticale
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun MenuIconButton(
+    icon: ImageVector,
+    label: String,
+    color: Color,
+    isActive: Boolean = false,
+    onClick: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.90f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "menu_btn_scale"
+    )
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .scale(scale)
+            .clickable(interactionSource = interactionSource, indication = null) { onClick() }
+            .padding(4.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(54.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(
+                    if (isActive) color.copy(alpha = 0.22f) else GlassWhite
+                )
+                .border(
+                    1.dp,
+                    if (isActive) color else GlassBorder,
+                    RoundedCornerShape(16.dp)
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = color,
+                modifier = Modifier.size(26.dp)
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = label,
+            color = color.copy(alpha = 0.90f),
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Componente: selettore slot (1–5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun SlotSelector(
+    label: String,
+    accentColor: Color,
+    onSlotSelected: (Int) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = label,
+            color = accentColor,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = 1.sp,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            (1..5).forEach { slot ->
+                SlotChip(slot = slot, accentColor = accentColor) { onSlotSelected(slot) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SlotChip(slot: Int, accentColor: Color, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.88f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "slot_chip_scale"
+    )
+
+    Box(
+        modifier = Modifier
+            .scale(scale)
+            .size(46.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(accentColor.copy(alpha = 0.14f))
+            .border(1.dp, accentColor.copy(alpha = 0.50f), RoundedCornerShape(12.dp))
+            .clickable(interactionSource = interactionSource, indication = null) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "$slot",
+            color = accentColor,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bridge verso PPSSPP (slot 1-5 → indice 0-4 per il motore)
+// ─────────────────────────────────────────────────────────────────────────────
+
+private fun saveState(slot: Int) {
+    // PPSSPP usa gli slot 0-indexed internamente
+    val index = (slot - 1).toString()
+    NativeApp.sendMessageFromJava("savestate_save", index)
+}
+
+private fun loadState(slot: Int) {
+    val index = (slot - 1).toString()
+    NativeApp.sendMessageFromJava("savestate_load", index)
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/onboarding/OnboardingScreen.kt ---
+
+package com.retropsp.app.ui.onboarding
+
+import android.net.Uri
+import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+@Composable
+fun OnboardingScreen(onFolderSelected: (Uri) -> Unit) {
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            Log.d("Onboarding", "Folder selected: $uri")
+            onFolderSelected(uri)
+        }
+    }
+
+    // Pulse animation on button
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 1f, targetValue = 1.05f, label = "scale",
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(listOf(Color(0xFF000000), Color(0xFF1A1A1A)))
+            )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Spacer(modifier = Modifier.height(32.dp))
+            Text(
+                text = "RetroPSP",
+                fontSize = 36.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFE0E0E0),
+                letterSpacing = 4.sp
+            )
+            Text(
+                text = "PSP Emulator",
+                fontSize = 14.sp,
+                color = Color(0xFF808080),
+                letterSpacing = 2.sp,
+                modifier = Modifier.padding(top = 4.dp, bottom = 48.dp)
+            )
+
+            Icon(
+                imageVector = Icons.Default.Folder,
+                contentDescription = null,
+                tint = Color(0xFFE0E0E0),
+                modifier = Modifier.size(80.dp)
+            )
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text(
+                text = "Select your ROM folder",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "RetroPSP needs access to the folder where your PSP games (.iso / .cso / .pbp) are stored.\n\n⚠️ Important Instructions:\n1. Create a dedicated folder for your games (e.g. 'PSP Games').\n2. Do NOT select the entire 'Downloads' folder.\n3. Make sure to tap 'USE THIS FOLDER' at the bottom of the Android menu.\n4. You cannot select individual game files, only the folder containing them.",
+                fontSize = 14.sp,
+                color = Color(0xFFAAAAAA),
+                textAlign = TextAlign.Start,
+                lineHeight = 22.sp,
+                modifier = Modifier.padding(horizontal = 8.dp)
+            )
+
+            Spacer(modifier = Modifier.height(48.dp))
+
+            Button(
+                onClick = { launcher.launch(null) },
+                modifier = Modifier
+                    .fillMaxWidth(0.85f)
+                    .height(56.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFE0E0E0),
+                    contentColor = Color.Black
+                )
+            ) {
+                Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Choose ROM Folder", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            }
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/home/HomeScreen.kt ---
+
+package com.retropsp.app.ui.home
+
+import android.net.Uri
+import android.util.Log
+import java.io.File
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoMode
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.retropsp.app.RetroPspApplication
+import com.retropsp.app.data.db.GameEntity
+import com.retropsp.app.monetization.AdBanner
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreen(
+    onGameClick: (GameEntity) -> Unit,
+    onSettingsClick: () -> Unit,
+    onRescanClick: () -> Unit,
+    onFolderSelected: (Uri) -> Unit
+) {
+    val context = LocalContext.current
+    val dao = (context.applicationContext as RetroPspApplication).database.gameDao()
+    val vm: HomeViewModel = viewModel(factory = HomeViewModel.Factory(dao))
+
+    val allGames by vm.allGames.collectAsState()
+    val recentGames by vm.recentGames.collectAsState()
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            onFolderSelected(uri)
+        } else {
+            android.widget.Toast.makeText(context, "Selection cancelled", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        "RetroPSP",
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                        color = Color(0xFFE0E0E0)
+                    )
+                },
+                actions = {
+                    IconButton(onClick = onRescanClick) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Rescan", tint = Color(0xFFE0E0E0))
+                    }
+                    IconButton(onClick = onSettingsClick) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color(0xFFE0E0E0))
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0A0A))
+            )
+        },
+        containerColor = Color(0xFF000000)
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            // Controller Support Banner
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF151515))
+                    .border(1.dp, Color(0xFF222222), RoundedCornerShape(8.dp))
+                    .padding(12.dp)
+            ) {
+                Text("🎮", fontSize = 24.sp, modifier = Modifier.padding(end = 12.dp))
+                Column {
+                    Text(
+                        text = "Plug & Play Supported",
+                        color = Color.White,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = "PS5, PS4 & Xbox controllers supported",
+                        color = Color(0xFF888888),
+                        fontSize = 11.sp
+                    )
+                }
+            }
+
+            // Recently Played row
+            if (recentGames.isNotEmpty()) {
+                Text(
+                    "Recently Played",
+                    color = Color(0xFF808080),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 8.dp)
+                )
+                LazyRow(
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(recentGames) { game ->
+                        RecentGameCard(game = game, onClick = { onGameClick(game) })
+                    }
+                }
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 12.dp),
+                    color = Color(0xFF1E1E1E)
+                )
+            }
+
+            // All games grid
+            if (allGames.isEmpty()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("🎮", fontSize = 48.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            "No games found.\nTap ↻ to scan or change your ROM folder.",
+                            textAlign = TextAlign.Center,
+                            color = Color(0xFF555555),
+                            fontSize = 14.sp,
+                            lineHeight = 22.sp
+                        )
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(
+                            onClick = { launcher.launch(null) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333))
+                        ) {
+                            Text("Change ROM Folder", color = Color.White)
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    items(allGames) { game ->
+                        GameListItem(game = game, onClick = { onGameClick(game) })
+                    }
+                }
+            }
+
+            // AdMob banner at bottom
+            AdBanner()
+        }
+    }
+}
+
+@Composable
+fun RecentGameCard(game: GameEntity, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(width = 90.dp, height = 90.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFF1A1A1A))
+            .clickable(onClick = onClick)
+    ) {
+        if (game.coverArtPath != null) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(game.coverArtPath)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = game.title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(listOf(Color(0xFF2A2A2A), Color(0xFF111111)))
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    game.title.take(2).uppercase(),
+                    color = Color(0xFF606060),
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+        // PSP badge bottom right
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(4.dp)
+                .background(Color(0x99000000), RoundedCornerShape(4.dp))
+                .padding(horizontal = 4.dp, vertical = 2.dp)
+        ) {
+            Text("PSP", color = Color(0xFFE0E0E0), fontSize = 7.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun GameListItem(game: GameEntity, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFF161616))
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Thumbnail Icon
+        Box(
+            modifier = Modifier
+                .size(50.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Brush.verticalGradient(listOf(Color(0xFF2A2A2A), Color(0xFF111111)))),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                game.title.take(2).uppercase(),
+                color = Color(0xFF606060),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        
+        Spacer(modifier = Modifier.width(16.dp))
+        
+        // Title
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = game.title,
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "PlayStation Portable",
+                color = Color(0xFF888888),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+        
+        Spacer(modifier = Modifier.width(8.dp))
+        
+        Icon(
+            imageVector = Icons.Default.AutoMode, // Just a small decoration
+            contentDescription = null,
+            tint = Color(0xFF333333),
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/home/HomeViewModel.kt ---
+
+package com.retropsp.app.ui.home
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.retropsp.app.data.db.GameDao
+import com.retropsp.app.data.db.GameEntity
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
+
+class HomeViewModel(dao: GameDao) : ViewModel() {
+
+    val allGames: StateFlow<List<GameEntity>> = dao.getAllGames()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val recentGames: StateFlow<List<GameEntity>> = dao.getRecentGames()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    class Factory(private val dao: GameDao) : ViewModelProvider.Factory {
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            @Suppress("UNCHECKED_CAST")
+            return HomeViewModel(dao) as T
+        }
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/settings/SettingsScreen.kt ---
+
+package com.retropsp.app.ui.settings
+
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(
+    onBack: () -> Unit,
+    onFolderSelected: (Uri) -> Unit
+) {
+    val context = LocalContext.current
+    var showPrivacyDialog by remember { mutableStateOf(false) }
+
+    val folderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            onFolderSelected(uri)
+        } else {
+            android.widget.Toast.makeText(context, "Selection cancelled", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ── Privacy Policy Dialog ─────────────────────────────────────────────────
+    if (showPrivacyDialog) {
+        AlertDialog(
+            onDismissRequest = { showPrivacyDialog = false },
+            title = {
+                Text(
+                    "Privacy Policy",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 380.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = "Last updated: May 2026\n\n" +
+
+                        "1. Data We Collect\n" +
+                        "RetroPSP does not collect, store, or transmit any personally identifiable information (PII). " +
+                        "All emulation features run completely offline on your device.\n\n" +
+
+                        "2. Storage Access\n" +
+                        "The app requests access to a folder you select or create to read PSP game files " +
+                        "(.iso, .cso, .pbp). We do not access, scan, or copy any other files outside that folder.\n\n" +
+
+                        "3. Advertising (Google AdMob)\n" +
+                        "To keep this app free, we display ads via Google AdMob. Google may use your device's " +
+                        "advertising ID to serve personalised ads. You can opt out via your Google Account > " +
+                        "Data & Privacy > Ad Settings.\n\n" +
+
+                        "4. Open Source & Licensing\n" +
+                        "RetroPSP is built on PPSSPP, licensed under the GNU GPL v2.0. The full source code " +
+                        "is publicly available (see 'View Source Code' button above). You have the right to " +
+                        "obtain, study, and modify it under the terms of the GPL.\n\n" +
+
+                        "5. Children's Privacy\n" +
+                        "This app is not directed at children under 13. We do not knowingly collect data " +
+                        "from children.\n\n" +
+
+                        "6. Changes to This Policy\n" +
+                        "We may update this policy to maintain compliance. Continued use of the app after " +
+                        "changes constitutes acceptance.\n\n" +
+
+                        "7. Contact\n" +
+                        "For questions or privacy requests: flyingllamay6@gmail.com",
+                        color = Color(0xFFCCCCCC),
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showPrivacyDialog = false }) {
+                    Text("OK", color = Color(0xFF4A90E2), fontWeight = FontWeight.Bold)
+                }
+            },
+            containerColor = Color(0xFF151515)
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text("Settings", color = Color(0xFFE0E0E0), fontWeight = FontWeight.Bold)
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = Color(0xFFE0E0E0)
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0A0A))
+            )
+        },
+        containerColor = Color(0xFF000000)
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+
+            // ── Storage ───────────────────────────────────────────────────────
+            SettingSectionHeader("Storage")
+
+            Button(
+                onClick = { folderLauncher.launch(null) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E1E1E))
+            ) {
+                Text("Change ROM Folder", color = Color.White)
+            }
+            Text(
+                "Select the folder where your .iso, .cso, or .pbp games are stored.",
+                color = Color(0xFF555555),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+            HorizontalDivider(color = Color(0xFF1E1E1E))
+            Spacer(modifier = Modifier.height(24.dp))
+
+
+            // ── Support & Monetization ────────────────────────────────────────
+            SettingSectionHeader("Support Us")
+
+            Button(
+                onClick = {
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW,
+                                Uri.parse("market://details?id=com.retropsp.pro"))
+                        )
+                    } catch (_: Exception) {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW,
+                                Uri.parse("https://play.google.com/store/apps/details?id=com.retropsp.pro"))
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE5B000)),
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+            ) {
+                Text("Get Ad-Free Pro Version", color = Color(0xFF2A2000), fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
+            }
+            Text(
+                "Support the developer and enjoy an uninterrupted, ad-free gaming experience.",
+                color = Color(0xFF888888),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+            HorizontalDivider(color = Color(0xFF1E1E1E))
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // ── Legal & Open Source ───────────────────────────────────────────
+            SettingSectionHeader("Legal & Open Source")
+
+            Text(
+                "RetroPSP v1.0  •  Powered by PPSSPP v1.17 (GPL v2.0)",
+                color = Color(0xFF666666),
+                fontSize = 12.sp
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // GPL v2.0 Source Code Link
+            Button(
+                onClick = {
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW,
+                                Uri.parse("https://github.com/flyingllamay/RetroPSP"))
+                        )
+                    } catch (_: Exception) {}
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A2A3A))
+            ) {
+                Text("View GPL v2.0 Source Code (GitHub)", color = Color(0xFF6AACF0))
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Privacy Policy
+            Button(
+                onClick = { showPrivacyDialog = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A1A))
+            ) {
+                Text("Privacy Policy", color = Color.White)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingSectionHeader(title: String) {
+    Text(
+        text = title.uppercase(),
+        color = Color(0xFF808080),
+        fontSize = 11.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 1.5.sp,
+        modifier = Modifier.padding(bottom = 8.dp)
+    )
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/ui/theme/Theme.kt ---
+
+package com.retropsp.app.ui.theme
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+
+private val DarkColorScheme = darkColorScheme(
+    primary = Color(0xFFE0E0E0),
+    secondary = Color(0xFFE0E0E0),
+    tertiary = Color(0xFFE0E0E0),
+    background = Color(0xFF000000),
+    surface = Color(0xFF000000),
+)
+
+@Composable
+fun RetroPSPTheme(
+    content: @Composable () -> Unit
+) {
+    MaterialTheme(
+        colorScheme = DarkColorScheme,
+        content = content
+    )
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/monetization/AdMobHelper.kt ---
+
+package com.retropsp.app.monetization
+
+import android.app.Activity
+import android.content.Context
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.AdSize
+import com.google.android.gms.ads.AdView
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.interstitial.InterstitialAd
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+
+class AdMobHelper(private val context: Context) {
+
+    private var interstitialAd: InterstitialAd? = null
+    private var interstitialShownThisSession = false
+
+    init {
+        MobileAds.initialize(context) {}
+        loadInterstitial()
+    }
+
+    private fun loadInterstitial() {
+        InterstitialAd.load(
+            context,
+            "ca-app-pub-****************/**********", // Production Interstitial ID
+            AdRequest.Builder().build(),
+            object : InterstitialAdLoadCallback() {
+                override fun onAdFailedToLoad(error: LoadAdError) { interstitialAd = null }
+                override fun onAdLoaded(ad: InterstitialAd) { interstitialAd = ad }
+            }
+        )
+    }
+
+    /** Shows the interstitial once per session; calls [onDismissed] immediately if already shown. */
+    fun showInterstitialOnce(activity: Activity, onDismissed: () -> Unit) {
+        val ad = interstitialAd
+        if (!interstitialShownThisSession && ad != null) {
+            ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                override fun onAdDismissedFullScreenContent() {
+                    interstitialShownThisSession = true
+                    onDismissed()
+                    loadInterstitial() // Reload for next potential use
+                }
+            }
+            ad.show(activity)
+        } else {
+            onDismissed()
+        }
+    }
+
+    /** Forces an interstitial to show if loaded, calling [onDismissed] after. Reloads ad when dismissed. */
+    fun forceShowInterstitial(activity: Activity, onDismissed: () -> Unit) {
+        val ad = interstitialAd
+        if (ad != null) {
+            ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                override fun onAdDismissedFullScreenContent() {
+                    onDismissed()
+                    loadInterstitial() // Reload for next potential use
+                }
+                override fun onAdFailedToShowFullScreenContent(e: com.google.android.gms.ads.AdError) {
+                    onDismissed()
+                }
+            }
+            ad.show(activity)
+            interstitialAd = null // Clear reference
+        } else {
+            onDismissed()
+        }
+    }
+}
+
+@Composable
+fun AdBanner(modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier.fillMaxWidth(),
+        factory = { ctx ->
+            AdView(ctx).apply {
+                setAdSize(AdSize.BANNER)
+                adUnitId = "ca-app-pub-****************/**********" // Production Banner ID
+                loadAd(AdRequest.Builder().build())
+            }
+        }
+    )
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/monetization/SaveStateObserver.kt ---
+
+package com.retropsp.app.monetization
+
+import android.app.Activity
+import android.util.Log
+import kotlinx.coroutines.*
+import java.io.File
+
+/**
+ * Monitors the PPSSPP save directories for changes.
+ * When a save state or in-game save is created/updated, it triggers an Interstitial Ad.
+ */
+class SaveStateObserver(
+    private val activity: Activity,
+    private val adMobHelper: AdMobHelper,
+    private val basePspDir: File
+) {
+    private var job: Job? = null
+    private var lastKnownModifiedTime = 0L
+
+    fun start() {
+        if (job != null) return
+        
+        val saveDir = File(basePspDir, "SAVEDATA")
+        val stateDir = File(basePspDir, "PPSSPP_STATE")
+        
+        lastKnownModifiedTime = getLatestModifiedTime(saveDir, stateDir)
+
+        job = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                delay(2000) // Poll every 2 seconds
+                val currentModifiedTime = getLatestModifiedTime(saveDir, stateDir)
+                if (currentModifiedTime > lastKnownModifiedTime) {
+                    Log.d("SaveStateObserver", "Save detected! Triggering interstitial.")
+                    lastKnownModifiedTime = currentModifiedTime
+                    
+                    withContext(Dispatchers.Main) {
+                        adMobHelper.forceShowInterstitial(activity) {}
+                    }
+                    
+                    // Delay to prevent multiple triggers from the same save action
+                    delay(5000) 
+                    lastKnownModifiedTime = getLatestModifiedTime(saveDir, stateDir)
+                }
+            }
+        }
+    }
+
+    fun stop() {
+        job?.cancel()
+        job = null
+    }
+
+    private fun getLatestModifiedTime(vararg dirs: File): Long {
+        var latest = 0L
+        for (dir in dirs) {
+            if (dir.exists() && dir.isDirectory) {
+                val dirMod = dir.lastModified()
+                if (dirMod > latest) latest = dirMod
+                
+                dir.listFiles()?.forEach { child ->
+                    val childMod = child.lastModified()
+                    if (childMod > latest) latest = childMod
+                    
+                    if (child.isDirectory) {
+                        child.listFiles()?.forEach { grandChild ->
+                            val gcMod = grandChild.lastModified()
+                            if (gcMod > latest) latest = gcMod
+                        }
+                    }
+                }
+            }
+        }
+        return latest
+    }
+}
+
+
+--- FILE: app/src/main/java/com/retropsp/app/monetization/BillingManager.kt ---
+
+package com.retropsp.app.monetization
+
+import android.content.Context
+import com.android.billingclient.api.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+
+class BillingManager(private val context: Context) {
+
+    private val _isAdFree = MutableStateFlow(false)
+    val isAdFree: StateFlow<Boolean> = _isAdFree
+
+    private val purchasesUpdatedListener = PurchasesUpdatedListener { result, purchases ->
+        if (result.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
+            purchases.forEach { handlePurchase(it) }
+        }
+    }
+
+    private val billingClient = BillingClient.newBuilder(context)
+        .setListener(purchasesUpdatedListener)
+        .enablePendingPurchases()
+        .build()
+
+    init {
+        billingClient.startConnection(object : BillingClientStateListener {
+            override fun onBillingSetupFinished(result: BillingResult) {
+                if (result.responseCode == BillingClient.BillingResponseCode.OK) queryPurchases()
+            }
+            override fun onBillingServiceDisconnected() { /* retry if needed */ }
+        })
+    }
+
+    private fun queryPurchases() {
+        billingClient.queryPurchasesAsync(
+            QueryPurchasesParams.newBuilder().setProductType(BillingClient.ProductType.INAPP).build()
+        ) { result, purchases ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                _isAdFree.value = purchases.any { it.products.contains("hd_pack") }
+            }
+        }
+    }
+
+    private fun handlePurchase(purchase: Purchase) {
+        if (purchase.purchaseState == Purchase.PurchaseState.PURCHASED) {
+            if (!purchase.isAcknowledged) {
+                billingClient.acknowledgePurchase(
+                    AcknowledgePurchaseParams.newBuilder()
+                        .setPurchaseToken(purchase.purchaseToken)
+                        .build()
+                ) { result ->
+                    if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                        _isAdFree.value = true
+                    }
+                }
+            } else {
+                _isAdFree.value = true
+            }
+        }
+    }
+}
+
+
+--- FILE: app/src/main/AndroidManifest.xml ---
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Required by PPSSPP for Bluetooth gamepad support -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <application
+        android:name=".RetroPspApplication"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="RetroPSP"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="false"
+        android:theme="@style/Theme.RetroPSP"
+        tools:targetApi="31">
+
+        <!-- PPSSPP requires hardware acceleration -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:hardwareAccelerated="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/Theme.RetroPSP.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-****************~**********" />
+    </application>
+</manifest>
+
+
+--- FILE: app/build.gradle.kts ---
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
+}
+
+android {
+    namespace = "com.retropsp.app"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.retropsp.app"
+        minSdk = 28
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+
+        ndk {
+            abiFilters.add("arm64-v8a")
+            abiFilters.add("armeabi-v7a")
+        }
+        externalNativeBuild {
+            cmake {
+                // Tell CMake this is an Android build
+                arguments(
+                    "-DANDROID=true",
+                    "-DANDROID_PLATFORM=android-28",
+                    "-DANDROID_TOOLCHAIN=clang",
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_CPP_FEATURES=",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,noexecstack",
+                    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,noexecstack"
+                )
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+        debug {
+            isMinifyEnabled = false
+            isJniDebuggable = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    buildFeatures {
+        compose = true
+        aidl = true
+        buildConfig = true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.10"
+    }
+
+    // Point to PPSSPP's CMakeLists.txt for the native build
+    externalNativeBuild {
+        cmake {
+            path = file("../ppsspp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    // Only pull PPSSPP game assets (shaders, textures) — NOT their full Activity source
+    // We copied the needed JNI bridge classes (NativeApp.java etc.) to src/main/java/org/ppsspp/ppsspp/
+    sourceSets {
+        getByName("main") {
+            java.srcDirs("src/main/java")
+            assets.srcDirs("src/main/assets", "../ppsspp/assets")
+        }
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+}
+
+dependencies {
+    // Jetpack Compose BOM
+    val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
+    implementation(composeBom)
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.activity:activity-compose:1.8.2")
+    implementation("androidx.navigation:navigation-compose:2.7.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+
+    // Coil for cover art
+    implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // Room database
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+
+    // WorkManager (background ROM scan)
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // DocumentFile (SAF)
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
+    // AdMob & Billing
+    implementation("com.google.android.gms:play-services-ads:23.0.0")
+    implementation("com.android.billingclient:billing-ktx:6.2.0")
+
+    // Core
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+}
